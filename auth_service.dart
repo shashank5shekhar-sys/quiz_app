@@ -1,15 +1,16 @@
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AuthService extends ChangeNotifier {
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final SupabaseClient _client = Supabase.instance.client;
 
-  User? get currentUser => _auth.currentUser;
-  Stream<User?> get authStateChanges => _auth.authStateChanges();
+  // ─── CURRENT USER ─────────────────────────────
+  User? get currentUser => _client.auth.currentUser;
 
-  // ─── Sign Up ──────────────────────────────────────────────────────────────
+  Stream<AuthState> get authStateChanges =>
+      _client.auth.onAuthStateChange;
+
+  // ─── SIGN UP ──────────────────────────────────
   Future<AuthResult> signUp({
     required String email,
     required String password,
@@ -17,60 +18,80 @@ class AuthService extends ChangeNotifier {
     String? phone,
   }) async {
     try {
-      final credential = await _auth.createUserWithEmailAndPassword(
+      final response = await _client.auth.signUp(
         email: email.trim(),
         password: password,
+        data: {
+          'name': name.trim(),
+          'phone': phone ?? '',
+          'profileComplete': false,
+        },
       );
 
-      // Update display name
-      await credential.user!.updateDisplayName(name.trim());
+      if (response.user != null) {
+        // Create user profile in DB
+        await _client.from('users').insert({
+          'id': response.user!.id,
+          'name': name.trim(),
+          'email': email.trim(),
+          'phone': phone ?? '',
+          'photo_url': '',
+          'bio': '',
+          'profile_complete': false,
+          'created_at': DateTime.now().toIso8601String(),
+        });
 
-      // Save user to Firestore
-      await _firestore.collection('users').doc(credential.user!.uid).set({
-        'uid': credential.user!.uid,
-        'name': name.trim(),
-        'email': email.trim(),
-        'phone': phone ?? '',
-        'photoUrl': '',
-        'createdAt': FieldValue.serverTimestamp(),
-        'profileComplete': false,
-      });
+        notifyListeners();
+        return AuthResult(
+          success: true,
+          message: 'Signup successful! Welcome 🎉',
+        );
+      }
 
-      notifyListeners();
-      return AuthResult(success: true, message: 'Signup successful! Welcome aboard 🎉');
-    } on FirebaseAuthException catch (e) {
-      return AuthResult(success: false, message: _getAuthErrorMessage(e.code));
+      return AuthResult(success: false, message: 'Signup failed');
     } catch (e) {
-      return AuthResult(success: false, message: 'Something went wrong. Please try again.');
+      return AuthResult(
+        success: false,
+        message: 'Error: ${e.toString()}',
+      );
     }
   }
 
-  // ─── Login ────────────────────────────────────────────────────────────────
+  // ─── LOGIN ─────────────────────────────────────
   Future<AuthResult> login({
     required String email,
     required String password,
   }) async {
     try {
-      await _auth.signInWithEmailAndPassword(
+      final response = await _client.auth.signInWithPassword(
         email: email.trim(),
         password: password,
       );
-      notifyListeners();
-      return AuthResult(success: true, message: 'Welcome back! 👋');
-    } on FirebaseAuthException catch (e) {
-      return AuthResult(success: false, message: _getAuthErrorMessage(e.code));
+
+      if (response.user != null) {
+        notifyListeners();
+        return AuthResult(
+          success: true,
+          message: 'Welcome back! 👋',
+        );
+      }
+
+      return AuthResult(success: false, message: 'Login failed');
     } catch (e) {
-      return AuthResult(success: false, message: 'Something went wrong. Please try again.');
+      return AuthResult(
+        success: false,
+        message: 'Error: ${e.toString()}',
+      );
     }
   }
 
-  // ─── Logout ───────────────────────────────────────────────────────────────
+  // ─── LOGOUT ───────────────────────────────────
   Future<void> logout() async {
-    await _auth.signOut();
+    await _client.auth.signOut();
     notifyListeners();
   }
 
-  // ─── Update Profile ───────────────────────────────────────────────────────
+  // ─── UPDATE PROFILE ───────────────────────────
   Future<AuthResult> updateProfile({
     required String name,
     String? phone,
@@ -78,68 +99,64 @@ class AuthService extends ChangeNotifier {
     String? bio,
   }) async {
     try {
-      final uid = currentUser!.uid;
+      final user = currentUser;
+      if (user == null) {
+        return AuthResult(
+          success: false,
+          message: 'User not logged in',
+        );
+      }
 
-      await currentUser!.updateDisplayName(name.trim());
-
-      final Map<String, dynamic> updates = {
+      final updates = {
         'name': name.trim(),
-        'updatedAt': FieldValue.serverTimestamp(),
-        'profileComplete': true,
+        'phone': phone ?? '',
+        'photo_url': photoUrl ?? '',
+        'bio': bio ?? '',
+        'profile_complete': true,
+        'updated_at': DateTime.now().toIso8601String(),
       };
 
-      if (phone != null) updates['phone'] = phone.trim();
-      if (photoUrl != null) updates['photoUrl'] = photoUrl;
-      if (bio != null) updates['bio'] = bio.trim();
-
-      await _firestore.collection('users').doc(uid).update(updates);
+      await _client.from('users').update(updates).eq('id', user.id);
 
       notifyListeners();
-      return AuthResult(success: true, message: 'Profile updated successfully!');
+      return AuthResult(
+        success: true,
+        message: 'Profile updated successfully!',
+      );
     } catch (e) {
-      return AuthResult(success: false, message: 'Failed to update profile.');
+      return AuthResult(
+        success: false,
+        message: 'Failed to update profile',
+      );
     }
   }
 
-  // ─── Get User Data ────────────────────────────────────────────────────────
+  // ─── GET USER DATA ────────────────────────────
   Future<Map<String, dynamic>?> getUserData() async {
     try {
-      if (currentUser == null) return null;
-      final doc = await _firestore.collection('users').doc(currentUser!.uid).get();
-      return doc.data();
+      final user = currentUser;
+      if (user == null) return null;
+
+      final data = await _client
+          .from('users')
+          .select()
+          .eq('id', user.id)
+          .single();
+
+      return data;
     } catch (e) {
       return null;
     }
   }
-
-  // ─── Error Messages ───────────────────────────────────────────────────────
-  String _getAuthErrorMessage(String code) {
-    switch (code) {
-      case 'weak-password':
-        return 'Password must be at least 6 characters.';
-      case 'email-already-in-use':
-        return 'This email is already registered.';
-      case 'invalid-email':
-        return 'Please enter a valid email address.';
-      case 'user-not-found':
-        return 'No account found with this email.';
-      case 'wrong-password':
-        return 'Incorrect password. Please try again.';
-      case 'too-many-requests':
-        return 'Too many attempts. Please try later.';
-      case 'user-disabled':
-        return 'This account has been disabled.';
-      case 'network-request-failed':
-        return 'Network error. Check your connection.';
-      default:
-        return 'Authentication failed. Please try again.';
-    }
-  }
 }
 
+// ─── RESULT MODEL ───────────────────────────────
 class AuthResult {
   final bool success;
   final String message;
 
-  AuthResult({required this.success, required this.message});
+  AuthResult({
+    required this.success,
+    required this.message,
+  });
 }
